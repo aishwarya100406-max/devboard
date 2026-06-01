@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const db = require('../db');
+const pool = require('../db');
 
 const router = express.Router();
 
@@ -20,18 +20,25 @@ router.post('/signup', async (req, res) => {
     return res.status(400).json({ error: 'username, email, and password are required' });
   }
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ? OR username = ?').get(email, username);
-  if (existing) {
-    return res.status(409).json({ error: 'Email or username already taken' });
+  try {
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE email = $1 OR username = $2',
+      [email, username]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'Email or username already taken' });
+    }
+
+    const password_hash = await bcrypt.hash(password, 12);
+    const result = await pool.query(
+      'INSERT INTO users (username, email, password_hash, github_username) VALUES ($1, $2, $3, $4) RETURNING id, username, email, github_username',
+      [username, email, password_hash, github_username || null]
+    );
+    const user = result.rows[0];
+    res.status(201).json({ token: signToken(user), user });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
   }
-
-  const password_hash = await bcrypt.hash(password, 12);
-  const result = db
-    .prepare('INSERT INTO users (username, email, password_hash, github_username) VALUES (?, ?, ?, ?)')
-    .run(username, email, password_hash, github_username || null);
-
-  const user = db.prepare('SELECT id, username, email, github_username FROM users WHERE id = ?').get(result.lastInsertRowid);
-  res.status(201).json({ token: signToken(user), user });
 });
 
 // POST /api/auth/login
@@ -41,32 +48,48 @@ router.post('/login', async (req, res) => {
     return res.status(400).json({ error: 'email and password are required' });
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-  const match = await bcrypt.compare(password, user.password_hash);
-  if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
 
-  const { password_hash, ...safeUser } = user;
-  res.json({ token: signToken(safeUser), user: safeUser });
+    const { password_hash, ...safeUser } = user;
+    res.json({ token: signToken(safeUser), user: safeUser });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // GET /api/auth/me
 const requireAuth = require('../middleware/auth');
-router.get('/me', requireAuth, (req, res) => {
-  const user = db
-    .prepare('SELECT id, username, email, github_username, created_at FROM users WHERE id = ?')
-    .get(req.user.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json(user);
+router.get('/me', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, username, email, github_username, created_at FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
-// PATCH /api/auth/me — update github_username
-router.patch('/me', requireAuth, (req, res) => {
+// PATCH /api/auth/me
+router.patch('/me', requireAuth, async (req, res) => {
   const { github_username } = req.body;
-  db.prepare('UPDATE users SET github_username = ? WHERE id = ?').run(github_username || null, req.user.id);
-  const user = db.prepare('SELECT id, username, email, github_username, created_at FROM users WHERE id = ?').get(req.user.id);
-  res.json(user);
+  try {
+    const result = await pool.query(
+      'UPDATE users SET github_username = $1 WHERE id = $2 RETURNING id, username, email, github_username, created_at',
+      [github_username || null, req.user.id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 module.exports = router;
